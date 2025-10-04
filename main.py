@@ -1,121 +1,94 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import os
-import json
-import re
-import google.generativeai as genai
+
+# Using Google Generative AI for portability with an API key
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
-from prompts import TEXT_TO_JSON_PROMPT, JSON_TO_TEXT_PROMPT
+
+# Import the functions and their input schemas from your tools file
+from tools import (
+    note_maker,
+    flashcard_generator,
+    concept_explainer,
+    UserInfo
+)
 
 # Load environment variables from .env file
 load_dotenv()
 
-def configure_gemini():
-    """Configures the Gemini API with the key from environment variables."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not found in .env file.")
-    genai.configure(api_key=api_key)
+# --- 1. Set up the LLM and the list of available tools ---
+# We explicitly pass the API key from the environment variable.
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0,
+    google_api_key=os.getenv("GEMINI_API_KEY")
+)
 
-def clean_json_response(text_response: str) -> str:
-    """Cleans the Gemini response to extract a valid JSON string."""
-    # Use regex to find the content between the first { and the last }
-    match = re.search(r'\{.*\}', text_response, re.DOTALL)
-    if match:
-        return match.group(0)
-    # Fallback for simple cases
-    return text_response.strip().lstrip('```json').rstrip('```')
+# This list contains the functions the LLM can choose from.
+tools = [
+    note_maker,
+    flashcard_generator,
+    concept_explainer,
+]
 
-def generate_tool_json(user_query: str, user_info: dict) -> dict:
+
+# --- 2. Create the Agent ---
+# The prompt is a set of instructions that guides the LLM's behavior.
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a helpful AI tutor assistant. You have access to several tools to help students. Use them when appropriate. The user's profile information is included in their message."),
+        ("user", "{input}"),
+        ("placeholder", "{agent_scratchpad}"), # This is where the agent's intermediate steps are stored
+    ]
+)
+
+# Create the agent that will use the LLM, tools, and prompt to make decisions.
+agent = create_tool_calling_agent(llm, tools, prompt)
+
+# The AgentExecutor is the runtime for the agent. It executes the tool calls.
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+
+# --- 3. Set up the FastAPI server ---
+app = FastAPI(
+    title="AI Tutor Orchestrator",
+    description="An intelligent middleware to connect an AI tutor with educational tools."
+)
+
+# Add CORS middleware to allow the frontend to communicate with this backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, restrict this to your frontend's domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class QueryRequest(BaseModel):
+    query: str
+    user_info: UserInfo
+
+@app.post("/invoke-agent")
+def invoke_agent_endpoint(request: QueryRequest):
     """
-    First API call: Takes a user query and generates a structured JSON object
-    for the appropriate educational tool.
+    This endpoint receives a user query and user info, invokes the agent,
+    and returns the final, user-friendly response.
     """
-    print("Step 1: Converting text query to structured JSON...")
+    print(f"Received query: {request.query}")
     
-    # Format the prompt with the student's data
-    prompt = TEXT_TO_JSON_PROMPT.format(
-        user_info=json.dumps(user_info, indent=2),
-        user_query=user_query
-    )
-    
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    response = model.generate_content(prompt)
-    
-    try:
-        # Clean the response to ensure it's valid JSON
-        cleaned_response = clean_json_response(response.text)
-        # Parse the JSON string into a Python dictionary
-        return json.loads(cleaned_response)
-    except (json.JSONDecodeError, IndexError) as e:
-        print(f"Error: Failed to parse JSON from the response. Details: {e}")
-        print(f"Raw Response:\n---\n{response.text}\n---")
-        return None
+    # We combine the query and user info into a single input for the agent.
+    # This ensures the LLM has all context needed to populate tool parameters.
+    input_prompt = f"User Query: '{request.query}'\n\nUser Info: {request.user_info.model_dump_json(indent=2)}"
 
-def get_tutor_response(tool_json: dict) -> str:
-    """
-    Second API call: Takes the structured JSON and generates a
-    user-friendly text response.
-    """
-    if not tool_json:
-        return "I'm sorry, I encountered an issue processing your request. Please try again."
+    # The .invoke() method runs the entire agent chain
+    response = agent_executor.invoke({
+        "input": input_prompt,
+    })
 
-    print("\nStep 2: Generating a text response from the JSON...")
-    
-    prompt = JSON_TO_TEXT_PROMPT.format(
-        tool_json=json.dumps(tool_json, indent=2)
-    )
-    
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    response = model.generate_content(prompt)
-    
-    return response.text
+    return {"response": response["output"]}
 
-def main():
-    """Main function to run the orchestrator demonstration."""
-    configure_gemini()
-    
-    # Mock student profile data, as described in the provided documents[cite: 633, 584].
-    mock_user_info = {
-        "user_id": "student123",
-        "name": "Alex",
-        "grade_level": "10",
-        "learning_style_summary": "Prefers visual aids and clear examples.",
-        "emotional_state_summary": "Curious and engaged",
-        "mastery_level_summary": "Level 5: Developing competence"
-    }
-
-    # --- DEMONSTRATION SCENARIOS ---
-    
-    # Scenario 1: Student needs an explanation
-    query1 = "I don't really get how photosynthesis works. Can you explain it simply?"
-    
-    # Scenario 2: Student wants to create flashcards for practice
-    query2 = "I need to study for my Biology test on the human heart. Can you make me 5 medium-difficulty flashcards?"
-    
-    # Scenario 3: Student needs structured notes
-    query3 = "Can you make me some outline-style notes on the main causes of World War II for my history class? Please include some analogies to help me understand."
-
-    queries = [query1, query2, query3]
-    
-    for i, query in enumerate(queries, 1):
-        print(f"\n{'='*20} SCENARIO {i} {'='*20}")
-        print(f"Student Query: \"{query}\"")
-        print("-" * 52)
-        
-        # Step 1: Generate the JSON
-        generated_json = generate_tool_json(query, mock_user_info)
-        
-        if generated_json:
-            print("\n✅ Successfully generated JSON:")
-            print(json.dumps(generated_json, indent=2))
-        
-            # Step 2: Generate the final text response
-            final_response = get_tutor_response(generated_json)
-            
-            print("\n✅ Final Tutor Response:")
-            print("-" * 25)
-            print(final_response)
-        
-        print(f"{'='*52}\n")
-
-if __name__ == "__main__":
-    main()
